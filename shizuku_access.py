@@ -441,6 +441,45 @@ if __name__ == "__main__":
     else:
         print(f"✗ {msg}")
 
+def rish_exec_with_retry(command: str, check: bool = True, timeout: int = 30,
+                         max_retries: int = 3, retry_delay: float = 5.0) -> Tuple[int, str, str]:
+    """
+    带重试的 rish_exec 包装函数
+    
+    在 RishTimeoutError 时自动等待并重试，缓解 Shizuku 连接偶发中断问题。
+    
+    Args:
+        command: 要执行的shell命令
+        check: 是否检查返回码
+        timeout: 单次超时（秒）
+        max_retries: 最大重试次数（不含首次执行，共执行 max_retries+1 次）
+        retry_delay: 每次重试前等待秒数
+    
+    Returns:
+        (returncode, stdout, stderr)
+    
+    Raises:
+        RishTimeoutError: 超过最大重试次数仍超时
+        其他 ShizukuError: 不重试，直接抛出
+    """
+    import time
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return rish_exec(command, check=check, timeout=timeout)
+        except RishTimeoutError as e:
+            last_exc = e
+            if attempt < max_retries:
+                import sys
+                print(f"⚠️  rish超时，{retry_delay:.0f}s后重试 ({attempt+1}/{max_retries})...",
+                      file=sys.stderr, flush=True)
+                time.sleep(retry_delay)
+            # else: 耗尽重试次数，继续到下面 raise
+        except (RishNotFoundError, RishPermissionError, RishExecutionError):
+            raise  # 非超时错误，不重试
+    raise last_exc  # type: ignore
+
+
 def list_quality_dirs(uid: str, c_folder: str) -> List[str]:
     """
     列出c_folder下存在的质量目录（如112、80等）
@@ -459,5 +498,85 @@ def list_quality_dirs(uid: str, c_folder: str) -> List[str]:
             if cleaned and cleaned.isdigit():
                 dirs.append(cleaned)
         return dirs
+    except Exception:
+        return []
+
+
+# ============================================================================
+# 缓存格式检测与 BLV 支持
+# ============================================================================
+
+# 格式常量
+FMT_DASH    = "dash"    # audio.m4s + video.m4s（DASH，当前主流）
+FMT_MP4     = "mp4"     # video.mp4 + audio.mp4（少数变体）
+FMT_BLV     = "blv"     # 0.blv / 1.blv … + index.json（旧版分段 FLV）
+FMT_UNKNOWN = "unknown"
+
+
+def detect_cache_format(uid: str, c_folder: str, quality: str) -> str:
+    """
+    探测质量目录内的实际缓存格式。
+
+    检测顺序（从新到旧）：
+      1. dash  — 存在 video.m4s
+      2. mp4   — 存在 video.mp4
+      3. blv   — 存在 index.json（旧版分段 FLV）
+      4. unknown
+
+    Returns:
+        FMT_DASH / FMT_MP4 / FMT_BLV / FMT_UNKNOWN
+    """
+    base = f"{BILI_ROOT}/{uid}/{c_folder}/{quality}"
+    checks = [
+        (FMT_DASH, f"{base}/video.m4s"),
+        (FMT_MP4,  f"{base}/video.mp4"),
+        (FMT_BLV,  f"{base}/index.json"),
+    ]
+    for fmt, path in checks:
+        try:
+            rc, _, _ = rish_exec(f"test -f {safe_path(path)}", check=False, timeout=15)
+            if rc == 0:
+                return fmt
+        except Exception:
+            continue
+    return FMT_UNKNOWN
+
+
+def read_index_json(uid: str, c_folder: str, quality: str) -> Optional[Dict]:
+    """
+    读取旧版 BLV 格式的 index.json（分段元数据）。
+
+    Returns:
+        解析后的 dict；失败返回 None
+    """
+    path = f"{BILI_ROOT}/{uid}/{c_folder}/{quality}/index.json"
+    try:
+        _, stdout, _ = rish_exec(f"cat {safe_path(path)}")
+        return json.loads(stdout)
+    except Exception:
+        return None
+
+
+def list_blv_segments(uid: str, c_folder: str, quality: str) -> List[str]:
+    """
+    列出 BLV 格式目录下的所有分段文件，按文件名数字升序。
+
+    典型文件名：0.blv, 1.blv, 2.blv …
+
+    Returns:
+        完整远程路径列表，例如
+        [".../quality/0.blv", ".../quality/1.blv"]
+    """
+    import re
+    base = f"{BILI_ROOT}/{uid}/{c_folder}/{quality}"
+    try:
+        _, stdout, _ = rish_exec(f"ls {safe_path(base)}")
+        names = []
+        for line in stdout.splitlines():
+            name = re.sub(r'\x1b\[[0-9;]*m', '', line.strip())
+            if name.endswith(".blv"):
+                names.append(name)
+        names.sort(key=lambda n: int(n.split(".")[0]) if n.split(".")[0].isdigit() else 0)
+        return [f"{base}/{n}" for n in names]
     except Exception:
         return []

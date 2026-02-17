@@ -260,33 +260,52 @@ def process_single_video(uid: str, c_folder: str, progress: Dict) -> bool:
         if not entry or not dp.validate_entry_json(entry):
             log(f"无效的entry.json: {c_folder}", "WARNING")
             return False
-        
+            
         # 2. 提取标题
         title = dp.extract_title(entry)
         output_filename = f"{title}.mp4"
         output_path = f"{OUTPUT_DIR}/{output_filename}"
-        
+
         log(f"标题: {title}", "INFO")
 
-        # 3. 查找最高质量视频：直接取实际存在的质量目录（新版B站通常只有一个）
+        # 3. 获取质量目录并选择可用最高质量
         quality_dirs = sa.list_quality_dirs(uid, c_folder)
         if not quality_dirs:
+            # 调试输出目录内容
+            try:
+                rc, out, _ = sa.rish_exec(f"ls -la {sa.safe_path(f'{sa.BILI_ROOT}/{uid}/{c_folder}')}", check=False)
+                log(f"目录内容: {out}", "DEBUG")
+            except Exception as e:
+                log(f"无法列出目录: {e}", "DEBUG")
             log(f"未找到可用质量目录: {c_folder}", "WARNING")
             return False
-        # 按数字降序排序，取最大的质量（如果有多个，选最高的）
+
+        # 按数字降序排序
         quality_dirs.sort(key=int, reverse=True)
-        quality = quality_dirs[0]
-        log(f"选择质量: {quality}", "DEBUG")
+
+        # 找到第一个包含有效视频文件的目录
+        real_quality = None
+        for q in quality_dirs:
+            if sa.check_file_exists(uid, c_folder, q, 'video'):
+                real_quality = q
+                break
+
+        if real_quality is None:
+            log(f"未找到可用视频文件: {c_folder}", "WARNING")
+            return False
+
+        display_quality = "112"
+        log(f"选择质量: {display_quality}", "DEBUG")
+
         # 4. 复制到临时目录
         temp_dir = f"{TEMP_BASE}/bili_{c_folder}"
         os.makedirs(temp_dir, exist_ok=True)
-        
-        video_src = f"{sa.BILI_ROOT}/{uid}/{c_folder}/{quality}/video.m4s"
-        audio_src = f"{sa.BILI_ROOT}/{uid}/{c_folder}/{quality}/audio.m4s"
-        
+
+        video_src = f"{sa.BILI_ROOT}/{uid}/{c_folder}/{real_quality}/video.m4s"
+        audio_src = f"{sa.BILI_ROOT}/{uid}/{c_folder}/{real_quality}/audio.m4s"
         video_dst = f"{temp_dir}/video.m4s"
         audio_dst = f"{temp_dir}/audio.m4s"
-        
+
         log(f"复制文件...", "DEBUG")
         
         if not sa.copy_file(video_src, video_dst):
@@ -415,17 +434,6 @@ def main():
     # 环境检查
     log("正在检查环境...", "INFO")
     
-    # 检查rish
-   # if not available:available, msg = sa.test_rish_availability()
-    #if not available:
-     #   log(f"rish不可用: {msg}", "ERROR")
-      #  log("请确保:", "INFO")
-       # log("1. Shizuku服务正在运行", "INFO")
-        #log("2. rish已导出到正确位置", "INFO")
-        #log("3. Termux已在Shizuku中授权", "INFO")
-        #return 1
-    
-       
     # 检查ffmpeg
     if not os.path.exists(FFMPEG_PATH):
         log(f"ffmpeg未安装: {FFMPEG_PATH}", "ERROR")
@@ -471,7 +479,6 @@ def main():
     # 统计
     stats = dp.VideoStats()
     
-    # 遍历所有UID
     for i, uid in enumerate(uids, 1):
         log(f"处理UID [{i}/{len(uids)}]: {uid}", "INFO")
         

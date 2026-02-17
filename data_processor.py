@@ -315,6 +315,55 @@ class VideoTask:
 
 
 # ============================================================================
+# BLV 分段元数据解析
+# ============================================================================
+
+def parse_index_json(index: Dict) -> List[str]:
+    """
+    从旧版 BLV 格式的 index.json 提取分段文件名列表。
+
+    index.json 已知结构（至少两种变体）：
+      变体A（数组）:  ["0.blv", "1.blv", ...]
+      变体B（对象）:  {"index": ["0.blv", "1.blv", ...]}
+      变体C（对象）:  {"segments": [{"filename": "0.blv"}, ...]}
+
+    当 index.json 缺失或无法解析时，调用方可直接用 list_blv_segments()
+    扫描目录作为后备。
+
+    Args:
+        index: read_index_json() 返回的原始 dict 或 list
+
+    Returns:
+        文件名列表（不含路径），如 ["0.blv", "1.blv"]；解析失败返回 []
+    """
+    if not index:
+        return []
+
+    # 变体A：顶层就是列表
+    if isinstance(index, list):
+        return [str(item) for item in index if str(item).endswith(".blv")]
+
+    if not isinstance(index, dict):
+        return []
+
+    # 变体B："index" 键
+    if "index" in index and isinstance(index["index"], list):
+        return [str(item) for item in index["index"] if str(item).endswith(".blv")]
+
+    # 变体C："segments" 键，每项含 "filename"
+    if "segments" in index and isinstance(index["segments"], list):
+        names = []
+        for seg in index["segments"]:
+            if isinstance(seg, dict) and "filename" in seg:
+                name = str(seg["filename"])
+                if name.endswith(".blv"):
+                    names.append(name)
+        return names
+
+    return []
+
+
+# ============================================================================
 # 测试函数
 # ============================================================================
 
