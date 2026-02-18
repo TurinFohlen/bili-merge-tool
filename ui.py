@@ -15,12 +15,13 @@
 - shizuku_access.py
 - data_processor.py
 """
-import shutil #详见后文
+import shutil  # 本地文件操作（导出功能）
 import os
 import sys
 import json
 import subprocess
 import re
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -46,6 +47,15 @@ PROGRESS_FILE = None  # 将在ensure_output_dir中设置
 
 # 导出失败时的备用路径（纯英文，避免中文路径问题）
 EXPORT_FALLBACK = "/storage/emulated/0/Download/BiliExported"
+
+# ============================================================================
+# 重试配置
+# ============================================================================
+
+# rish 操作最大重试次数
+RISH_MAX_RETRIES = 3
+# 每次重试前等待秒数
+RISH_RETRY_DELAY = 5.0
 
 # ============================================================================
 # 日志函数
@@ -157,19 +167,83 @@ def save_progress(progress: Dict[str, bool]):
 # 视频处理
 # ============================================================================
 
-def merge_video(temp_dir: str, output_path: str) -> bool:
+def merge_blv(temp_dir: str, output_path: str) -> bool:
+    """
+    合并旧版 BLV 分段为 MP4。
+
+    策略：用 ffmpeg concat demuxer，把所有 *.blv 当作 FLV 流拼接，
+    输出为 MP4 容器（-c copy，无重编码）。
+
+    Args:
+        temp_dir:    已将所有 *.blv 复制到此目录
+        output_path: 输出 MP4 路径
+
+    Returns:
+        是否成功
+    """
+    if not os.path.exists(FFMPEG_PATH):
+        log(f"ffmpeg未安装: {FFMPEG_PATH}", "ERROR")
+        return False
+
+    # 按数字升序收集所有 .blv 文件
+    blv_files = sorted(
+        [f for f in os.listdir(temp_dir) if f.endswith(".blv")],
+        key=lambda n: int(n.split(".")[0]) if n.split(".")[0].isdigit() else 0
+    )
+
+    if not blv_files:
+        log("临时目录内未找到 .blv 文件", "ERROR")
+        return False
+
+    # 生成 ffmpeg concat 列表文件
+    concat_list = os.path.join(temp_dir, "concat.txt")
+    with open(concat_list, "w", encoding="utf-8") as f:
+        for name in blv_files:
+            # ffmpeg concat 需要单引号转义路径中的单引号
+            escaped = os.path.join(temp_dir, name).replace("'", "'\\''")
+            f.write(f"file '{escaped}'\n")
+
+    cmd = [
+        FFMPEG_PATH,
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_list,
+        "-c", "copy",
+        "-y",
+        output_path
+    ]
+
+    log(f"合并 {len(blv_files)} 段 BLV → MP4...", "INFO")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            log(f"BLV 合并成功: {os.path.basename(output_path)}", "SUCCESS")
+            return True
+        else:
+            log("BLV 合并失败: 输出文件不存在或为空", "ERROR")
+            if result.stderr:
+                log(f"ffmpeg stderr: {result.stderr[:300]}", "DEBUG")
+            return False
+    except subprocess.TimeoutExpired:
+        log("ffmpeg BLV 合并超时 (>10分钟)", "ERROR")
+        return False
+    except Exception as e:
+        log(f"ffmpeg BLV 合并异常: {e}", "ERROR")
+        return False
     """
     使用ffmpeg合并音视频文件
     
     Args:
         temp_dir: 临时目录路径
         output_path: 输出MP4文件路径
+        audio_file: 音频文件路径；为None时仅做视频remux（旧版无独立音频）
     
     Returns:
         是否成功
     """
     video_file = f"{temp_dir}/video.m4s"
-    audio_file = f"{temp_dir}/audio.m4s"
+    if audio_file is None:
+        audio_file = f"{temp_dir}/audio.m4s" if os.path.exists(f"{temp_dir}/audio.m4s") else None
     
     # 检查ffmpeg是否存在
     if not os.path.exists(FFMPEG_PATH):
@@ -178,18 +252,28 @@ def merge_video(temp_dir: str, output_path: str) -> bool:
         return False
     
     # 构建ffmpeg命令
-    cmd = [
-        FFMPEG_PATH,
-        "-i", video_file,
-        "-i", audio_file,
-        "-c", "copy",  # 直接复制流，不重新编码
-        "-y",  # 覆盖已存在的文件
-        output_path
-    ]
+    if audio_file and os.path.exists(audio_file):
+        cmd = [
+            FFMPEG_PATH,
+            "-i", video_file,
+            "-i", audio_file,
+            "-c", "copy",  # 直接复制流，不重新编码
+            "-y",          # 覆盖已存在的文件
+            output_path
+        ]
+        log("正在合并音视频...", "INFO")
+    else:
+        # 无音频：仅做视频 remux（兼容旧版缓存）
+        cmd = [
+            FFMPEG_PATH,
+            "-i", video_file,
+            "-c", "copy",
+            "-y",
+            output_path
+        ]
+        log("未找到音频流，仅 remux 视频...", "WARNING")
     
     try:
-        log(f"正在合并视频...", "INFO")
-        
         # 执行ffmpeg（不设超时，等待完成）
         result = subprocess.run(
             cmd,
@@ -260,64 +344,118 @@ def process_single_video(uid: str, c_folder: str, progress: Dict) -> bool:
         if not entry or not dp.validate_entry_json(entry):
             log(f"无效的entry.json: {c_folder}", "WARNING")
             return False
-            
+        
         # 2. 提取标题
         title = dp.extract_title(entry)
         output_filename = f"{title}.mp4"
         output_path = f"{OUTPUT_DIR}/{output_filename}"
-
+        
         log(f"标题: {title}", "INFO")
 
-        # 3. 获取质量目录并选择可用最高质量
+        # 3. 格式检测：扫描质量目录，判断 DASH / MP4变体 / BLV
         quality_dirs = sa.list_quality_dirs(uid, c_folder)
         if not quality_dirs:
-            # 调试输出目录内容
-            try:
-                rc, out, _ = sa.rish_exec(f"ls -la {sa.safe_path(f'{sa.BILI_ROOT}/{uid}/{c_folder}')}", check=False)
-                log(f"目录内容: {out}", "DEBUG")
-            except Exception as e:
-                log(f"无法列出目录: {e}", "DEBUG")
             log(f"未找到可用质量目录: {c_folder}", "WARNING")
             return False
-
-        # 按数字降序排序
         quality_dirs.sort(key=int, reverse=True)
+        quality = quality_dirs[0]
 
-        # 找到第一个包含有效视频文件的目录
-        real_quality = None
-        for q in quality_dirs:
-            if sa.check_file_exists(uid, c_folder, q, 'video'):
-                real_quality = q
-                break
-
-        if real_quality is None:
-            log(f"未找到可用视频文件: {c_folder}", "WARNING")
-            return False
-
-        display_quality = "112"
-        log(f"选择质量: {display_quality}", "DEBUG")
+        fmt = sa.detect_cache_format(uid, c_folder, quality)
+        log(f"质量: {quality}  格式: {fmt}", "DEBUG")
 
         # 4. 复制到临时目录
         temp_dir = f"{TEMP_BASE}/bili_{c_folder}"
         os.makedirs(temp_dir, exist_ok=True)
+        base_path = f"{sa.BILI_ROOT}/{uid}/{c_folder}/{quality}"
 
-        video_src = f"{sa.BILI_ROOT}/{uid}/{c_folder}/{real_quality}/video.m4s"
-        audio_src = f"{sa.BILI_ROOT}/{uid}/{c_folder}/{real_quality}/audio.m4s"
-        video_dst = f"{temp_dir}/video.m4s"
-        audio_dst = f"{temp_dir}/audio.m4s"
+        # ---- 分支：BLV 旧版分段 ----
+        if fmt == sa.FMT_BLV:
+            segments = sa.list_blv_segments(uid, c_folder, quality)
 
-        log(f"复制文件...", "DEBUG")
-        
-        if not sa.copy_file(video_src, video_dst):
-            log(f"复制视频文件失败: {c_folder}", "ERROR")
-            return False
-        
-        if not sa.copy_file(audio_src, audio_dst):
-            log(f"复制音频文件失败: {c_folder}", "ERROR")
-            return False
-        
-        # 5. 合并视频
-        success = merge_video(temp_dir, output_path)
+            # 后备：若 index.json 可解析，用它校验/补充顺序
+            index_data = sa.read_index_json(uid, c_folder, quality)
+            if index_data:
+                names_from_index = dp.parse_index_json(index_data)
+                if names_from_index:
+                    segments = [f"{base_path}/{n}" for n in names_from_index]
+
+            if not segments:
+                log(f"BLV 格式但未找到分段文件: {c_folder}", "ERROR")
+                return False
+
+            log(f"BLV 分段数: {len(segments)}", "INFO")
+            for seg_path in segments:
+                seg_name = os.path.basename(seg_path)
+                dst = os.path.join(temp_dir, seg_name)
+                if not sa.copy_file(seg_path, dst):
+                    log(f"复制分段失败: {seg_name}", "ERROR")
+                    return False
+
+            # 5a. BLV 合并
+            success = merge_blv(temp_dir, output_path)
+
+        # ---- 分支：DASH / MP4变体（含音频或纯视频）----
+        else:
+            video_dst = f"{temp_dir}/video.m4s"
+            audio_dst = f"{temp_dir}/audio.m4s"
+
+            # 视频文件：m4s → mp4 后备
+            video_candidates = (
+                ("video.m4s", "video.mp4") if fmt == sa.FMT_DASH
+                else ("video.mp4", "video.m4s")
+            )
+            video_src = None
+            for vname in video_candidates:
+                candidate = f"{base_path}/{vname}"
+                try:
+                    sa.rish_exec_with_retry(
+                        f"test -f {sa.safe_path(candidate)}",
+                        check=True, timeout=15,
+                        max_retries=RISH_MAX_RETRIES,
+                        retry_delay=RISH_RETRY_DELAY
+                    )
+                    video_src = candidate
+                    break
+                except (sa.RishExecutionError, sa.RishTimeoutError):
+                    continue
+            if not video_src:
+                log(f"视频文件不存在（已尝试 .m4s/.mp4）: {c_folder}", "ERROR")
+                return False
+
+            # 音频文件：m4s → mp4 后备（允许缺失）
+            audio_candidates = (
+                ("audio.m4s", "audio.mp4") if fmt == sa.FMT_DASH
+                else ("audio.mp4", "audio.m4s")
+            )
+            audio_src = None
+            for aname in audio_candidates:
+                candidate = f"{base_path}/{aname}"
+                try:
+                    sa.rish_exec_with_retry(
+                        f"test -f {sa.safe_path(candidate)}",
+                        check=True, timeout=15,
+                        max_retries=RISH_MAX_RETRIES,
+                        retry_delay=RISH_RETRY_DELAY
+                    )
+                    audio_src = candidate
+                    break
+                except (sa.RishExecutionError, sa.RishTimeoutError):
+                    continue
+
+            log("复制文件...", "DEBUG")
+            if not sa.copy_file(video_src, video_dst):
+                log(f"复制视频文件失败: {c_folder}", "ERROR")
+                return False
+            if audio_src:
+                if not sa.copy_file(audio_src, audio_dst):
+                    log(f"复制音频文件失败: {c_folder}", "ERROR")
+                    return False
+            else:
+                log("未找到音频文件，将仅 remux 视频", "WARNING")
+                audio_dst = None
+
+            # 5b. DASH/MP4 合并
+            success = merge_video(temp_dir, output_path, audio_file=audio_dst)
         
         # 6. 记录进度
         if success:
@@ -434,6 +572,17 @@ def main():
     # 环境检查
     log("正在检查环境...", "INFO")
     
+    # 检查rish
+   # if not available:available, msg = sa.test_rish_availability()
+    #if not available:
+     #   log(f"rish不可用: {msg}", "ERROR")
+      #  log("请确保:", "INFO")
+       # log("1. Shizuku服务正在运行", "INFO")
+        #log("2. rish已导出到正确位置", "INFO")
+        #log("3. Termux已在Shizuku中授权", "INFO")
+        #return 1
+    
+       
     # 检查ffmpeg
     if not os.path.exists(FFMPEG_PATH):
         log(f"ffmpeg未安装: {FFMPEG_PATH}", "ERROR")
@@ -479,39 +628,58 @@ def main():
     # 统计
     stats = dp.VideoStats()
     
+    # 遍历所有UID
     for i, uid in enumerate(uids, 1):
         log(f"处理UID [{i}/{len(uids)}]: {uid}", "INFO")
         
-        try:
-            # 列出c_*文件夹
-            c_folders = sa.list_c_folders(uid)
-            
-            if not c_folders:
-                log(f"  未找到缓存文件夹", "WARNING")
+        # 带重试获取 c_* 列表
+        c_folders = None
+        for attempt in range(RISH_MAX_RETRIES + 1):
+            try:
+                c_folders = sa.list_c_folders(uid)
+                break
+            except sa.RishTimeoutError:
+                if attempt < RISH_MAX_RETRIES:
+                    log(f"  获取缓存列表超时，{RISH_RETRY_DELAY:.0f}s后重试 ({attempt+1}/{RISH_MAX_RETRIES})", "WARNING")
+                    time.sleep(RISH_RETRY_DELAY)
+                else:
+                    log(f"  获取缓存列表超时次数过多，跳过 UID {uid}", "ERROR")
+            except sa.ShizukuError as e:
+                log(f"  Shizuku错误，跳过 UID {uid}: {e}", "ERROR")
+                break
+        
+        if c_folders is None:
+            continue
+        
+        if not c_folders:
+            log(f"  未找到缓存文件夹", "WARNING")
+            continue
+        
+        log(f"  发现 {len(c_folders)} 个缓存文件夹", "INFO")
+        
+        # 处理每个视频
+        for c_folder in c_folders:
+            # 检查是否已完成
+            if progress.get(c_folder):
+                stats.add_skipped()
                 continue
             
-            log(f"  发现 {len(c_folders)} 个缓存文件夹", "INFO")
-            
-            # 处理每个视频
-            for c_folder in c_folders:
-                # 检查是否已完成
-                if progress.get(c_folder):
-                    stats.add_skipped()
-                    continue
-                
-                # 处理单个视频
+            # 处理单个视频，超时仅跳过该视频（不中断整个 UID）
+            try:
                 success = process_single_video(uid, c_folder, progress)
-                
-                if success:
-                    stats.add_success()
-                else:
-                    stats.add_failed()
-                
+            except sa.RishTimeoutError:
+                log(f"  处理 {c_folder} 时 rish 超时，已跳过（可下次重试）", "WARNING")
+                stats.add_failed()
+                time.sleep(RISH_RETRY_DELAY)
                 print()
-        
-        except sa.ShizukuError as e:
-            log(f"  处理UID失败: {e}", "ERROR")
-            continue
+                continue
+            
+            if success:
+                stats.add_success()
+            else:
+                stats.add_failed()
+            
+            print()
     
     # 最终统计
     print("\n" + "=" * 60)
