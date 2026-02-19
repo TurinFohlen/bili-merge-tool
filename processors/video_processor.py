@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""视频处理器（核心编排组件）"""
+"""视频处理器（核心编排组件）- 增强版，支持根目录检测，音频缺失时失败"""
 import os, shutil
 from typing import Dict
 from registry import registry
@@ -83,11 +83,12 @@ class VideoProcessor:
         流程：
           1. 检查进度 → 跳过已完成
           2. 读取 entry.json → 提取标题
-          3. 扫描质量目录 → 选最高质量
+          3. 扫描质量目录 → 选最高质量；若无质量目录，尝试根目录
           4. 检测格式 (DASH / MP4 / BLV)
           5. 根据格式调用对应 extractor
-          6. 调用 merger 合并
-          7. 记录进度
+          6. 若为 DASH/MP4 且音频缺失，则失败（不生成无声视频）
+          7. 调用 merger 合并
+          8. 记录进度
         """
         # 1. 检查进度
         if progress.get(c_folder):
@@ -113,21 +114,30 @@ class VideoProcessor:
             # 4. 扫描质量目录
             quality_dirs = self.scanner.list_quality_dirs(uid, c_folder)
             if not quality_dirs:
-                print(f"⚠️  未找到质量目录: {c_folder}")
-                return False
-            quality_dirs.sort(key=int, reverse=True)
-            quality = quality_dirs[0]
+                # 无质量子目录，尝试检测根目录下是否有视频文件
+                print(f"ℹ️  未找到质量目录，尝试检测根目录...")
+                # 使用特殊 quality='.' 来指示检测根目录
+                fmt = self.format_detector.detect(uid, c_folder, '.')
+                if fmt == "unknown":
+                    print(f"⚠️  根目录也未找到视频文件: {c_folder}")
+                    return False
+                # 根目录下存在视频，使用 quality='.' 继续
+                quality = '.'
+                quality_label = "根目录"
+            else:
+                # 有质量子目录，选择最高的
+                quality_dirs.sort(key=int, reverse=True)
+                quality = quality_dirs[0]
+                fmt = self.format_detector.detect(uid, c_folder, quality)
+                quality_label = self.format_detector.quality_label(quality)
             
-            # 5. 检测格式
-            fmt = self.format_detector.detect(uid, c_folder, quality)
-            quality_label = self.format_detector.quality_label(quality)
             print(f"ℹ️  质量: {quality_label}  格式: {fmt}")
             
-            # 6. 创建临时目录
+            # 5. 创建临时目录
             temp_dir = f"{self.temp_base}/bili_{c_folder}"
             os.makedirs(temp_dir, exist_ok=True)
             
-            # 7. 根据格式提取 + 合并
+            # 6. 根据格式提取 + 合并
             if fmt == "blv":
                 success = self.extractor_blv.extract(uid, c_folder, quality, temp_dir)
                 if not success:
@@ -140,13 +150,17 @@ class VideoProcessor:
                 )
                 if not success:
                     return False
+                # 音频缺失时直接失败，不生成无声视频
+                if audio_dst is None:
+                    print(f"❌ 未找到音频文件，放弃合并: {c_folder}")
+                    return False
                 success = self.merger.merge_dash(temp_dir, output_path, audio_file=audio_dst)
             
             else:
                 print(f"❌ 未知格式: {fmt}")
                 return False
             
-            # 8. 记录进度
+            # 7. 记录进度
             if success:
                 progress[c_folder] = True
                 self.progress_mgr.save(progress)

@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""B站缓存扫描组件（扫描 UID 和 c_* 文件夹）"""
+import re
+from typing import List
+from registry import registry
+
+@registry.register("bili.scanner", "service", "list_uids() -> List[str]")
+class BiliScanner:
+    def __init__(self):
+        self.bili_root = "/storage/emulated/0/Android/data/tv.danmaku.bili/download"
+        self.rish_exec = None
+    
+    def set_rish_executor(self, rish_exec):
+        self.rish_exec = rish_exec
+    
+    def _parse_ls(self, stdout: str) -> List[str]:
+        """清洗 ls 输出"""
+        result = []
+        for line in stdout.splitlines():
+            name = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if name:
+                result.append(name)
+        return result
+    
+    def list_uids(self) -> List[str]:
+        if not self.rish_exec:
+            raise RuntimeError("rish_exec 未注入")
+        rc, out, err = self.rish_exec(f"/system/bin/ls -1 '{self.bili_root}'")
+        print(f"[DEBUG] ls output length: {len(out)}")
+        print(f"[DEBUG] ls output first 500 chars: {out[:500]}")
+        print(f"[DEBUG] ls stderr: {err}")
+        
+        # 先用标准方式解析
+        lines = self._parse_ls(out)
+        uids = [n for n in lines if n.isdigit()]
+        
+        # 如果只有一个 UID 且长度异常（可能为合并的字符串），尝试用正则提取所有数字
+        if len(uids) == 1 and len(uids[0]) > 10:
+            import re
+            all_numbers = re.findall(r'\d+', out)
+            uids = [n for n in all_numbers if n.isdigit()]
+            print(f"[DEBUG] 正则提取到 {len(uids)} 个 UID")
+        
+        return uids
+    
+    def list_c_folders(self, uid: str) -> List[str]:
+        """返回指定 UID 下所有 c_* 文件夹"""
+        if not self.rish_exec:
+            raise RuntimeError("rish_exec 未注入")
+        path = f"{self.bili_root}/{uid}"
+        _, out, _ = self.rish_exec(f"ls '{path}'")
+        return [n for n in self._parse_ls(out) if n.startswith("c_")]
+    
+    def list_quality_dirs(self, uid: str, c_folder: str) -> List[str]:
+        """返回质量目录（纯数字目录）"""
+        if not self.rish_exec:
+            raise RuntimeError("rish_exec 未注入")
+        path = f"{self.bili_root}/{uid}/{c_folder}"
+        _, out, _ = self.rish_exec(f"ls '{path}'")
+        return [n for n in self._parse_ls(out) if n.isdigit()]

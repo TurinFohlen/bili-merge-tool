@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""缓存格式检测组件（DASH / MP4 / BLV）"""
+"""缓存格式检测组件（DASH / MP4 / BLV）- 增强版，支持根目录检测"""
 from registry import registry
 
 # 格式常量
@@ -15,16 +15,26 @@ class BiliFormatDetector:
     def __init__(self):
         self.bili_root = "/storage/emulated/0/Android/data/tv.danmaku.bili/download"
         self.rish_exec = None
-    
+
     def set_rish_executor(self, rish_exec):
         self.rish_exec = rish_exec
-    
+
     def detect(self, uid: str, c_folder: str, quality: str) -> str:
-        """探测格式：dash / mp4 / blv / unknown"""
+        """
+        探测格式：dash / mp4 / blv / unknown
+        如果 quality 为 '.' 或空字符串，表示直接检查 c_folder 根目录。
+        """
         if not self.rish_exec:
             raise RuntimeError("rish_exec 未注入")
-        base = f"{self.bili_root}/{uid}/{c_folder}/{quality}"
-        for fmt, fname in [(FMT_DASH,"video.m4s"),(FMT_MP4,"video.mp4"),(FMT_BLV,"index.json")]:
+
+        # 根据 quality 构造基础路径
+        if quality == '.' or quality == '':
+            base = f"{self.bili_root}/{uid}/{c_folder}"
+        else:
+            base = f"{self.bili_root}/{uid}/{c_folder}/{quality}"
+
+        # 按优先级检查文件
+        for fmt, fname in [(FMT_DASH, "video.m4s"), (FMT_MP4, "video.mp4"), (FMT_BLV, "index.json")]:
             try:
                 rc, _, _ = self.rish_exec(f"test -f '{base}/{fname}'", check=False, timeout=15)
                 if rc == 0:
@@ -32,7 +42,7 @@ class BiliFormatDetector:
             except Exception:
                 continue
         return FMT_UNKNOWN
-    
+
     def quality_label(self, q: str) -> str:
         """质量标签"""
         l = QUALITY_LABEL.get(q)

@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""rish 命令执行组件 - WebSocket 客户端版（最终稳定版，带空闲超时和延迟）"""
+import os
+import time
+import asyncio
+import threading
+from typing import Tuple
+from registry import registry
+
+# 尝试导入 websockets，如果失败则降级
+try:
+    import websockets
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    print("⚠️  websockets 未安装，将使用进程模式")
+
+@registry.register("rish.executor", "service", "exec(command: str, timeout: int = 30) -> Tuple[int,str,str]")
+class RishExecutor:
+    def __init__(self):
+        self.rish_path = "./rish"  # 备用进程模式路径
+        self.app_id = "com.termux"
+        self.max_retries = 3
+        self.retry_delay_base = 1.0
+        self.retry_delay_max = 5.0
+
+        # WebSocket 配置
+        self.ws_url = "ws://127.0.0.1:8080"
+        self.ws_conn = None
+        self.ws_lock = threading.Lock()
+        self._use_websocket = WEBSOCKET_AVAILABLE
+
+        # 尝试连接 WebSocket
+        if self._use_websocket:
+            try:
+                self.loop = asyncio.new_event_loop()
+                self.thread = threading.Thread(target=self._run_loop, daemon=True)
+                self.thread.start()
+                time.sleep(1)  # 等待连接建立
+                if self.ws_conn is None:
+                    print("⚠️  WebSocket 连接失败，将使用进程模式")
+                    self._use_websocket = False
+            except Exception as e:
+                print(f"⚠️  WebSocket 初始化失败: {e}，将使用进程模式")
+                self._use_websocket = False
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._websocket_client())
+
+    async def _websocket_client(self):
+        """持续运行，维护 WebSocket 连接"""
+        while True:
+            try:
+                async with websockets.connect(self.ws_url) as websocket:
+                    with self.ws_lock:
+                        self.ws_conn = websocket
+                    print("✅ WebSocket 连接成功")
+                    await websocket.wait_closed()
+            except Exception as e:
+                print(f"⚠️ WebSocket 连接断开: {e}，5秒后重连...")
+                await asyncio.sleep(5)
+            finally:
+                with self.ws_lock:
+                    self.ws_conn = None
+
+    async def _send_via_websocket(self, command: str, timeout: int) -> Tuple[int, str, str]:
+        """通过 WebSocket 发送命令，使用空闲超时接收所有数据"""
+        if not self.ws_conn:
+            raise ConnectionError("WebSocket 未连接")
+        print(f"[WS] Sending command: {command[:50]}...")
+        await self.ws_conn.send(command)
+
+        chunks = []
+        last_receive_time = time.time()
+        idle_timeout = 0.5  # 空闲超时，若0.5秒无新数据则认为传输结束
+
+        while time.time() - last_receive_time < idle_timeout:
+            try:
+                msg = await asyncio.wait_for(self.ws_conn.recv(), timeout=0.1)
+                chunks.append(msg)
+                last_receive_time = time.time()
+                print(f"[WS] Received chunk {len(chunks)}, length {len(msg)}")
+            except asyncio.TimeoutError:
+                # 超时说明没有新数据，继续循环等待 idle_timeout
+                continue
+            except websockets.exceptions.ConnectionClosed:
+                print("[WS] Connection closed")
+                break
+
+        # 命令执行后添加短暂延迟，避免高频请求（时间换空间）
+        await asyncio.sleep(0.2)
+
+        full_response = '\n'.join(chunks)
+        print(f"[WS] Total {len(chunks)} chunks, total length {len(full_response)}")
+        if len(chunks) == 0:
+            raise RuntimeError("No data received from WebSocket")
+        return 0, full_response, ""
+
+    def _execute_via_websocket(self, command: str, check: bool, timeout: int) -> Tuple[int, str, str]:
+        """同步包装异步 WebSocket 调用"""
+        future = asyncio.run_coroutine_threadsafe(
+            self._send_via_websocket(command, timeout),
+            self.loop
+        )
+        try:
+            return future.result(timeout + 1)  # 额外加1秒缓冲
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"命令执行超时 (>{timeout}s): {command[:80]}")
+
+    # ---------- 进程模式（备用）----------
+    def _execute_via_process(self, command: str, check: bool, timeout: int) -> Tuple[int, str, str]:
+        """使用 subprocess 执行（每次新建进程）"""
+        import subprocess
+        env = os.environ.copy()
+        env["RISH_APPLICATION_ID"] = self.app_id
+        try:
+            result = subprocess.run(
+                [self.rish_path, "-c", command],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(f"命令执行超时 (>{timeout}s): {command[:80]}")
+        rc = result.returncode
+        stdout = result.stdout
+        stderr = result.stderr
+        return rc, stdout, stderr
+
+    # ---------- 统一执行入口 ----------
+    def _execute(self, command: str, check: bool, timeout: int) -> Tuple[int, str, str]:
+        """优先使用 WebSocket，失败则回退到进程模式"""
+        if self._use_websocket:
+            try:
+                return self._execute_via_websocket(command, check, timeout)
+            except Exception as e:
+                print(f"⚠️ WebSocket 执行失败，回退到进程模式: {e}")
+                self._use_websocket = False  # 临时禁用，后续命令用进程模式
+        # 进程模式
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self._execute_via_process(command, check, timeout)
+            except (TimeoutError, subprocess.CalledProcessError) as e:
+                if attempt == self.max_retries:
+                    raise
+                delay = min(self.retry_delay_base * (2 ** attempt), self.retry_delay_max)
+                print(f"  ⚠ 进程模式命令失败，{delay:.1f}s 后重试 ({attempt+1}/{self.max_retries})", flush=True)
+                time.sleep(delay)
+            except (FileNotFoundError, PermissionError):
+                raise
+        # 不会执行到这里
+
+    # ---------- 对外接口 ----------
+    def exec(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+        rc, out, err = self._execute(command, check, timeout)
+        if check and rc != 0:
+            err_lower = err.lower()
+            if "no such file" in err_lower:
+                raise FileNotFoundError(f"文件不存在: {command[:80]}")
+            elif "permission denied" in err_lower:
+                raise PermissionError(f"权限不足: {command[:80]}")
+            elif "no space left" in err_lower:
+                raise OSError(f"磁盘空间不足: {command[:80]}")
+            else:
+                raise RuntimeError(f"命令失败 (rc={rc}): {command[:80]} — {err[:100]}")
+        return rc, out, err
+
+    def exec_with_retry(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+        return self.exec(command, check, timeout)
+
+    def __call__(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+        return self.exec(command, check, timeout)
+
+    def close(self):
+        if hasattr(self, 'loop') and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)

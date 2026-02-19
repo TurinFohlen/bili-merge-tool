@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""rish 命令执行组件（持久会话版）- 进入 rish shell 并保持连接"""
+import os
+import subprocess
+import time
+import threading
+import queue
+import select
+from typing import Tuple
+from registry import registry
+from error_log import record_event, exception_to_error
+
+@registry.register("rish.executor", "service", "exec(command: str, timeout: int = 30) -> Tuple[int,str,str]")
+class RishExecutor:
+    def __init__(self):
+        self.rish_path = "/data/data/com.termux/files/home/shizuku-rish/rish"
+        self.app_id = "com.termux"
+        self.max_retries = 100          # 命令执行重试次数（用于 exec_with_retry）
+        self.retry_delay_base = 2.0
+        self.retry_delay_max = 60.0
+
+        # 持久会话相关
+        self._proc = None               # 子进程对象
+        self._lock = threading.Lock()   # 保护会话的锁
+        self._cmd_counter = 0            # 用于生成唯一请求ID（可选）
+        self._need_restart = False       # 标记是否需要重启会话
+
+        # 启动初始会话
+        self._ensure_session()
+
+    def _ensure_session(self):
+        """确保会话存在且可用，如果不可用则启动新会话"""
+        with self._lock:
+            if self._proc and self._proc.poll() is None:
+                # 进程还在运行，简单检查是否可通信？暂时认为可用
+                return
+            # 启动新进程
+            env = os.environ.copy()
+            if self.app_id:
+                env["RISH_APPLICATION_ID"] = self.app_id
+            try:
+                self._proc = subprocess.Popen(
+                    [self.rish_path],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    universal_newlines=True,
+                    bufsize=1  # 行缓冲
+                )
+                # 可选：等待 shell 提示符出现？rish 可能没有提示符，直接发送命令即可
+                # 我们简单等待一小会儿确保启动
+                time.sleep(0.2)
+                # 清空可能出现的启动信息
+                self._flush_output()
+            except Exception as e:
+                raise RuntimeError(f"无法启动 rish 会话: {e}")
+
+    def _flush_output(self):
+        """清空当前输出缓冲区，避免干扰后续命令"""
+        if not self._proc:
+            return
+        # 使用 select 或非阻塞读清空
+        import select
+        while True:
+            rlist, _, _ = select.select([self._proc.stdout, self._proc.stderr], [], [], 0.1)
+            if not rlist:
+                break
+            for fd in rlist:
+                fd.readline()  # 读取一行丢弃
+
+    def _send_command(self, command: str, timeout: int) -> Tuple[int, str, str]:
+        """
+        通过持久会话发送命令，读取输出。
+        返回 (返回码, stdout, stderr) 的模拟。
+        注意：rish 命令通常没有返回码概念，我们通过命令输出自行判断。
+        但为了兼容原有接口，我们模拟返回码：若命令执行过程中没有异常，返回0；否则非0。
+        """
+        self._ensure_session()
+
+        # 发送命令（末尾加换行）
+        try:
+            self._proc.stdin.write(command + "\n")
+            self._proc.stdin.flush()
+        except BrokenPipeError:
+            # 管道破裂，会话可能已死，尝试重启
+            self._proc = None
+            self._ensure_session()
+            # 重发
+            self._proc.stdin.write(command + "\n")
+            self._proc.stdin.flush()
+
+        # 读取输出直到命令执行完毕（如何判断命令结束？）
+        # 对于 rish，每个命令的输出后面可能没有明确结束符。
+        # 我们采用简单策略：读取直到一段时间内没有新数据。
+        stdout_lines = []
+        stderr_lines = []
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # 检查 stdout
+            rlist, _, _ = select.select([self._proc.stdout, self._proc.stderr], [], [], 0.2)
+            for fd in rlist:
+                line = fd.readline()
+                if not line:
+                    # EOF? 可能会话结束
+                    break
+                if fd is self._proc.stdout:
+                    stdout_lines.append(line)
+                else:
+                    stderr_lines.append(line)
+            # 如果一段时间没有输出，认为命令结束
+            if not rlist:
+                break
+        else:
+            # 超时
+            raise TimeoutError(f"命令执行超时 (>{timeout}s): {command[:80]}")
+
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
+
+        # 模拟返回码：如果 stderr 中有明显错误，返回非0
+        if stderr and "error" in stderr.lower():
+            rc = 1
+        else:
+            rc = 0
+
+        return rc, stdout, stderr
+
+    def _call_with_session(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+        """通过持久会话执行命令，并处理可能的会话重启"""
+        try:
+            return self._send_command(command, timeout)
+        except (BrokenPipeError, IOError) as e:
+            # 会话断开，尝试重启一次
+            self._proc = None
+            self._ensure_session()
+            return self._send_command(command, timeout)
+
+    # ---------- 原有接口（兼容） ----------
+    def exec(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+        """单次执行（通过持久会话）"""
+        rc, out, err = self._call_with_session(command, check, timeout)
+        if check and rc != 0:
+            # 根据 stderr 内容抛出具体异常（同之前）
+            err_lower = err.lower()
+            if "no such file or directory" in err_lower:
+                raise FileNotFoundError(f"文件不存在: {command[:80]}")
+            elif "permission denied" in err_lower:
+                raise PermissionError(f"权限不足: {command[:80]}")
+            elif "no space left" in err_lower:
+                raise OSError(f"磁盘空间不足: {command[:80]}")
+            else:
+                raise RuntimeError(f"命令失败 (rc={rc}): {command[:80]} — {err[:100]}")
+        return rc, out, err
+
+    def exec_with_retry(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+        """带重试的执行（递归实现，复用现有逻辑）"""
+        def _retry(attempt: int, retries_left: int):
+            try:
+                return self.exec(command, check, timeout)
+            except (TimeoutError, RuntimeError) as e:
+                if isinstance(e, RuntimeError):
+                    e_str = str(e).lower()
+                    if any(key in e_str for key in ["no such file", "permission denied", "disk full"]):
+                        raise
+                if retries_left <= 0:
+                    raise e
+                delay = min(self.retry_delay_base * (2 ** attempt), self.retry_delay_max)
+                print(f"  ⚠ rish 命令失败 ({type(e).__name__})，{delay:.1f}s 后重试 (剩余 {retries_left} 次)", flush=True)
+                time.sleep(delay)
+                return _retry(attempt + 1, retries_left - 1)
+            except (FileNotFoundError, PermissionError, OSError):
+                raise
+        return _retry(0, self.max_retries)
+
+    def __call__(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+        """使实例可调用，默认使用带重试的 exec_with_retry"""
+        return self.exec_with_retry(command, check, timeout)
+
+    def close(self):
+        """关闭持久会话（可选项，程序退出时调用）"""
+        if self._proc:
+            self._proc.terminate()
+            self._proc.wait(2)
+            self._proc = None

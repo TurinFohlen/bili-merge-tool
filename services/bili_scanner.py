@@ -23,14 +23,29 @@ class BiliScanner:
         return result
     
     def list_uids(self) -> List[str]:
-        """返回所有纯数字 UID 文件夹"""
         if not self.rish_exec:
             raise RuntimeError("rish_exec 未注入")
-        _, out, _ = self.rish_exec(f"ls '{self.bili_root}'")
-        return [n for n in self._parse_ls(out) if n.isdigit()]
+        rc, out, err = self.rish_exec(f"/system/bin/ls -1 '{self.bili_root}'")
+        print(f"[DEBUG] ls output length: {len(out)}")
+        print(f"[DEBUG] ls output first 500 chars: {out[:500]}")
+        print(f"[DEBUG] ls stderr: {err}")
+        
+        # 按行解析
+        lines = self._parse_ls(out)
+        uids = [n for n in lines if n.isdigit()]
+        
+        # 如果解析出的行数太少且输出总长度很大，可能是缺少换行，尝试正则提取
+        if len(uids) == 1 and len(out) > 1000:
+            import re
+            all_numbers = re.findall(r'\d+', out)
+            uids = [n for n in all_numbers if n.isdigit()]
+            print(f"[DEBUG] 正则提取到 {len(uids)} 个 UID")
+        else:
+            print(f"[DEBUG] 按行解析到 {len(uids)} 个 UID")
+        
+        return uids
     
     def list_c_folders(self, uid: str) -> List[str]:
-        """返回指定 UID 下所有 c_* 文件夹"""
         if not self.rish_exec:
             raise RuntimeError("rish_exec 未注入")
         path = f"{self.bili_root}/{uid}"
@@ -38,7 +53,6 @@ class BiliScanner:
         return [n for n in self._parse_ls(out) if n.startswith("c_")]
     
     def list_quality_dirs(self, uid: str, c_folder: str) -> List[str]:
-        """返回质量目录（纯数字目录）"""
         if not self.rish_exec:
             raise RuntimeError("rish_exec 未注入")
         path = f"{self.bili_root}/{uid}/{c_folder}"
