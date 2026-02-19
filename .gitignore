@@ -1,5 +1,0 @@
-*.bak
-*.tmp
-__pycache__/
-legacy/
-test_*.py

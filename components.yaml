@@ -1,0 +1,181 @@
+version: '1.0'
+total_components: 14
+components:
+- name: bili.entry_reader
+  type: service
+  signature: 'read(uid: str, c_folder: str) -> Optional[Dict]'
+  dependencies: []
+  registration_order: 0
+  source_file: services/bili_entry_reader.py
+  class_name: BiliEntryReader
+- name: bili.format_detector
+  type: service
+  signature: 'detect(uid: str, c_folder: str, quality: str) -> str'
+  dependencies: []
+  registration_order: 1
+  source_file: services/bili_format_detector.py
+  class_name: BiliFormatDetector
+- name: bili.scanner
+  type: service
+  signature: list_uids() -> List[str]
+  dependencies: []
+  registration_order: 2
+  source_file: services/bili_scanner.py
+  class_name: BiliScanner
+- name: extractor.blv
+  type: service
+  signature: extract(uid, c_folder, quality, temp_dir) -> bool
+  dependencies:
+  - file.operator
+  registration_order: 3
+  source_file: services/extractor_blv.py
+  class_name: ExtractorBlv
+- name: extractor.dash
+  type: service
+  signature: extract(uid, c_folder, quality, temp_dir) -> tuple
+  dependencies:
+  - file.operator
+  registration_order: 4
+  source_file: services/extractor_dash.py
+  class_name: ExtractorDash
+- name: file.operator
+  type: service
+  signature: 'copy(src: str, dst: str) -> bool'
+  dependencies: []
+  registration_order: 5
+  source_file: services/file_operator.py
+  class_name: FileOperator
+- name: merger.ffmpeg
+  type: service
+  signature: merge_dash(...) -> bool
+  dependencies: []
+  registration_order: 6
+  source_file: services/merger_ffmpeg.py
+  class_name: MergerFFmpeg
+- name: progress.manager
+  type: service
+  signature: load() -> Dict[str, bool]
+  dependencies: []
+  registration_order: 7
+  source_file: services/progress_manager.py
+  class_name: ProgressManager
+- name: rish.executor
+  type: service
+  signature: 'exec(command: str, timeout: int = 30) -> Tuple[int,str,str]'
+  dependencies: []
+  registration_order: 8
+  source_file: services/rish_executor.py
+  class_name: RishExecutor
+- name: video.processor
+  type: processor
+  signature: process(uid, c_folder, progress) -> bool
+  dependencies:
+  - extractor.blv
+  - extractor.dash
+  registration_order: 9
+  source_file: processors/video_processor.py
+  class_name: VideoProcessor
+- name: ui.cli
+  type: ui
+  signature: main() -> int
+  dependencies:
+  - bili.entry_reader
+  - bili.format_detector
+  - bili.scanner
+  - exporter.local
+  - extractor.blv
+  - extractor.dash
+  - file.operator
+  - merger.ffmpeg
+  - progress.manager
+  - rish.executor
+  - video.processor
+  registration_order: 10
+  source_file: uis/cli_main.py
+  class_name: CliMain
+- name: exporter.local
+  type: service
+  signature: export(source_dir, target_dir) -> tuple
+  dependencies: []
+  registration_order: 11
+  source_file: exporters/local_exporter.py
+  class_name: LocalExporter
+- name: test.caller
+  type: service
+  signature: call() -> None
+  dependencies: []
+  registration_order: 12
+  source_file: test_error_log.py
+  class_name: TestCaller
+- name: test.callee
+  type: service
+  signature: do_work() -> None
+  dependencies: []
+  registration_order: 13
+  source_file: test_error_log.py
+  class_name: TestCallee
+adjacency_matrix:
+  nodes:
+  - bili.entry_reader
+  - bili.format_detector
+  - bili.scanner
+  - extractor.blv
+  - extractor.dash
+  - file.operator
+  - merger.ffmpeg
+  - progress.manager
+  - rish.executor
+  - video.processor
+  - ui.cli
+  - exporter.local
+  - test.caller
+  - test.callee
+  csr_format:
+    data:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    indices:
+    - 5
+    - 5
+    - 3
+    - 4
+    - 0
+    - 1
+    - 2
+    - 11
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    row_ptrs:
+    - 0
+    - 0
+    - 0
+    - 0
+    - 1
+    - 2
+    - 2
+    - 2
+    - 2
+    - 2
+    - 4
+    - 15
+    - 15
+    - 15
+    - 15
