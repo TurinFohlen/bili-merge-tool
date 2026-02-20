@@ -1,73 +1,87 @@
 #!/usr/bin/env python3
-"""命令行界面（主入口）"""
-import os, sys, time, atexit
-from registry import registry
-import error_log
+"""
+命令行界面 v3.2.0 - 支持本地缓存模式
 
-@registry.register("ui.cli", "ui", "main() -> int")
-class CliMain:
+新特性：
+  - 统一打包分片传输
+  - 本地缓存复用
+  - 彻底摆脱 rish 不稳定问题
+"""
+import os
+import sys
+from registry import registry
+
+@registry.register("ui.cli.v2", "ui", "main() -> int")
+class CliMainV2:
     def __init__(self):
         self.rish_exec = None
         self.scanner = None
-        self.video_processor = None
+        self.pack_transfer = None
+        self.local_finder = None
+        self.video_processor_local = None
         self.progress_mgr = None
         self.exporter = None
         
         self.output_dir = "/storage/emulated/0/Download/B站视频"
+        self.local_cache_dir = "/storage/emulated/0/Download/bili_local_cache"
     
     def setup_dependencies(self):
         """从注册中心获取所有依赖组件实例"""
-        # 获取服务实例
+        # 基础服务
         rish_executor = registry.get_service("rish.executor")
-        file_operator = registry.get_service("file.operator")
-        self.scanner = registry.get_service("bili.scanner")
-        entry_reader = registry.get_service("bili.entry_reader")
-        format_detector = registry.get_service("bili.format_detector")
-        extractor_dash = registry.get_service("extractor.dash")
-        extractor_blv = registry.get_service("extractor.blv")
-        merger = registry.get_service("merger.ffmpeg")
-        self.progress_mgr = registry.get_service("progress.manager")
-        self.video_processor = registry.get_service("video.processor")
-        self.exporter = registry.get_service("exporter.local")
-        
-        # 注入 rish_exec 到各个需要它的组件
         self.rish_exec = rish_executor.exec_with_retry
-        file_operator.set_rish_executor(self.rish_exec)
-        self.scanner.set_rish_executor(self.rish_exec)
-        entry_reader.set_rish_executor(self.rish_exec)
-        format_detector.set_rish_executor(self.rish_exec)
-        extractor_dash.set_dependencies(file_operator, self.rish_exec)
-        extractor_blv.set_dependencies(file_operator, self.rish_exec)
         
-        # 注入 video_processor 的依赖
-        self.video_processor.set_dependencies(
-            scanner=self.scanner,
-            entry_reader=entry_reader,
-            format_detector=format_detector,
-            extractor_dash=extractor_dash,
-            extractor_blv=extractor_blv,
+        self.scanner = registry.get_service("bili.scanner")
+        self.scanner.set_rish_executor(self.rish_exec)
+        
+        # 新组件：打包传输
+        self.pack_transfer = registry.get_service("pack.transfer")
+        self.pack_transfer.set_rish_executor(self.rish_exec)
+        self.pack_transfer.set_local_cache(self.local_cache_dir)
+        
+        # 新组件：本地文件查找
+        self.local_finder = registry.get_service("local.file_finder")
+        
+        # 合并器
+        merger = registry.get_service("merger.ffmpeg")
+        
+        # 进度管理
+        self.progress_mgr = registry.get_service("progress.manager")
+        self.progress_mgr.set_progress_file(f"{self.output_dir}/.bili_progress.json")
+        
+        # 新处理器：本地缓存模式
+        self.video_processor_local = registry.get_service("video.processor.local")
+        self.video_processor_local.set_dependencies(
+            pack_transfer=self.pack_transfer,
+            local_finder=self.local_finder,
             merger=merger,
             progress_mgr=self.progress_mgr
         )
         
-        # 设置进度文件路径
-        self.progress_mgr.set_progress_file(f"{self.output_dir}/.bili_progress.json")
+        # 导出器
+        self.exporter = registry.get_service("exporter.local")
     
     def print_banner(self):
         print("=" * 60)
-        print("      B站缓存视频合并工具 v3.0（组件化）")
+        print("   B站缓存视频合并工具 v3.2.0（本地缓存模式）")
+        print("=" * 60)
+        print()
+        print("🎯 新特性：")
+        print("  · 统一打包分片传输")
+        print("  · 本地缓存复用（断点续传）")
+        print("  · 彻底摆脱 rish 不稳定问题")
         print("=" * 60)
         print()
     
     def check_environment(self) -> bool:
-        """环境检查（rish + ffmpeg）"""
+        """环境检查（rish + ffmpeg + 本地缓存目录）"""
         print("ℹ️  检查环境...")
         
-        # 检查 rish（通过调用测试命令）
+        # 检查 rish（仅用于数据传输）
         try:
             rc, out, err = self.rish_exec("echo __bili_test__", check=False, timeout=30)
             if rc == 0 and "__bili_test__" in out:
-                print("✅ rish: 可用")
+                print("✅ rish: 可用（用于数据传输）")
             else:
                 print(f"❌ rish 响应异常: rc={rc}")
                 return False
@@ -83,6 +97,14 @@ class CliMain:
             return False
         print("✅ ffmpeg: 已安装")
         
+        # 创建本地缓存目录
+        try:
+            os.makedirs(self.local_cache_dir, exist_ok=True)
+            print(f"✅ 本地缓存目录: {self.local_cache_dir}")
+        except Exception as e:
+            print(f"❌ 无法创建缓存目录: {e}")
+            return False
+        
         return True
     
     def ensure_output_dir(self):
@@ -95,7 +117,7 @@ class CliMain:
             raise
     
     def main(self) -> int:
-        """主流程"""
+        """主流程（本地缓存模式）"""
         self.print_banner()
         
         # 1. 设置依赖
@@ -138,7 +160,7 @@ class CliMain:
         for i, uid in enumerate(uids, 1):
             print(f"ℹ️  处理 UID [{i}/{len(uids)}]: {uid}")
             
-            # 获取 c_* 列表（带重试）
+            # 获取 c_* 列表
             try:
                 c_folders = self.scanner.list_c_folders(uid)
             except Exception as e:
@@ -160,22 +182,17 @@ class CliMain:
             if not pending:
                 continue
             
-            # 处理每个视频
+            # 处理每个视频（使用本地缓存模式）
             for c_folder in pending:
                 stats['total'] += 1
-                success = self.video_processor.process(uid, c_folder, progress)
+                success = self.video_processor_local.process(uid, c_folder, progress)
                 if success:
                     stats['success'] += 1
                 else:
                     stats['failed'] += 1
                 print()
         
-        # 8. 打印entry.json错误统计（如果有）
-        entry_reader = registry.get_service("bili.entry_reader")
-        if hasattr(entry_reader, 'print_stats'):
-            entry_reader.print_stats()
-        
-        # 9. 最终统计
+        # 8. 最终统计
         print("\n" + "=" * 60)
         print("✅ 全部完成!")
         print("=" * 60)
@@ -186,7 +203,7 @@ class CliMain:
         print("=" * 60)
         print()
         
-        # 10. 询问是否导出
+        # 9. 询问是否导出
         if stats['success'] > 0 or stats['skipped'] > 0:
             choice = input("是否导出已合并的视频? (y/n): ").strip().lower()
             if choice == 'y':

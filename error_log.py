@@ -37,10 +37,11 @@ prime_map: Dict[str, int] = {
     "disk_full":        11,
     "auth_failed":      13,
     "unknown":          17,  # 未识别异常的默认映射
+    "execution_error":  19,  # 命令执行失败（非零返回码）
 }
 
 # 用于扩展 prime_map 时自动分配下一个可用素数
-_next_prime_candidates = [19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67]
+_next_prime_candidates = [23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83]
 
 
 def register_error_type(error_name: str) -> int:
@@ -72,6 +73,7 @@ _exception_map: Dict[type, str] = {
     ConnectionRefusedError: "network_error",
     OSError:                "disk_full",      # 磁盘满常以 OSError 出现
     MemoryError:            "disk_full",
+    RuntimeError:           "execution_error",  # rish 命令执行失败
 }
 
 
