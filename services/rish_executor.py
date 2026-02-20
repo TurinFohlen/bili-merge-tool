@@ -13,23 +13,19 @@ class RishExecutor:
         self.max_retries = 100
         self.retry_delay_base = 2.0
         self.retry_delay_max = 60.0
-
+    
     def exec(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
         """执行单次 rish 命令（不含重试）- v2.0 异常细化版"""
         if not os.path.exists(self.rish_path):
             raise FileNotFoundError(f"rish 未找到: {self.rish_path}")
-
-        # 🔥 核心修复：每条命令强制携带包名，不依赖会话环境
-        full_command = f"RISH_APPLICATION_ID={self.app_id} {command}"
-
+        
         env = os.environ.copy()
-        # 环境变量仍然保留，双重保险
         if self.app_id:
             env["RISH_APPLICATION_ID"] = self.app_id
-
+        
         try:
             result = subprocess.run(
-                [self.rish_path], input=full_command,
+                [self.rish_path], input=command,
                 capture_output=True, text=True,
                 timeout=timeout, env=env
             )
@@ -37,11 +33,11 @@ class RishExecutor:
             raise TimeoutError(f"rish 超时 (>{timeout}s): {command[:80]}")
         except FileNotFoundError:
             raise FileNotFoundError(f"rish 无法执行: {self.rish_path}")
-
+        
         # 检查返回码和 stderr，抛出具体异常
         if check and result.returncode != 0:
             stderr_lower = result.stderr.lower()
-
+            
             # 权限错误
             if "permission denied" in stderr_lower:
                 raise PermissionError(
@@ -49,7 +45,7 @@ class RishExecutor:
                     f"命令: {command[:80]}\n"
                     f"stderr: {result.stderr[:200]}"
                 )
-
+            
             # 文件不存在错误
             if "no such file or directory" in stderr_lower:
                 raise FileNotFoundError(
@@ -57,7 +53,7 @@ class RishExecutor:
                     f"命令: {command[:80]}\n"
                     f"stderr: {result.stderr[:200]}"
                 )
-
+            
             # 磁盘空间不足
             if "no space left" in stderr_lower or "disk full" in stderr_lower:
                 raise OSError(
@@ -65,21 +61,21 @@ class RishExecutor:
                     f"命令: {command[:80]}\n"
                     f"stderr: {result.stderr[:200]}"
                 )
-
+            
             # 通用执行错误
             raise RuntimeError(
                 f"命令执行失败 (rc={result.returncode})\n"
                 f"命令: {command[:80]}\n"
                 f"stderr: {result.stderr[:200]}"
             )
-
+        
         return result.returncode, result.stdout, result.stderr
-
+    
     def exec_with_retry(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
         """带指数退避重试的执行"""
         attempt = 0
         last_exc = None
-
+        
         while self.max_retries < 0 or attempt <= self.max_retries:
             try:
                 return self.exec(command, check, timeout)
@@ -93,5 +89,5 @@ class RishExecutor:
                 attempt += 1
             except (FileNotFoundError, PermissionError, RuntimeError):
                 raise
-
+        
         raise last_exc  # type: ignore

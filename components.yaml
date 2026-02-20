@@ -123,7 +123,7 @@ components:
   class_name: LocalFileFinder
 - name: pack.transfer
   type: service
-  signature: download_and_extract(uid, c_folder, cleanup) -> bool
+  signature: download_and_extract(...) -> bool
   dependencies: []
   registration_order: 15
   source_file: services/pack_transfer.py
